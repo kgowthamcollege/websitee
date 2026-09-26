@@ -17,6 +17,8 @@ import Faq from "./pages/Faq";
 import Contact from "./pages/Contact";
 
 import { WHATSAPP_NUMBER, currency } from "./data/constants";
+import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from "firebase/auth";
+import { auth, clearAdminData, saveInquiry, saveOrder, subscribeToAdminData } from "./firebase";
 
 /**
  * Amman Studios Gifts — React conversion
@@ -33,12 +35,9 @@ import { WHATSAPP_NUMBER, currency } from "./data/constants";
  *    multiple megabytes of inline data) and replaced with the same CSS
  *    gradient placeholders the page already used as a fallback. Swap in
  *    real image URLs via the `gradient`/`img` fields in src/data/constants.js.
- *  - Razorpay / GPay / Supabase / jsPDF integrations required real API
- *    keys and a backend, so those are stubbed: "Pay Now" and "Scan to
- *    Pay" show the UI but don't move real money, and the admin panel
- *    reads from in-memory state instead of a database. "Checkout via
- *    WhatsApp" and the contact/upload forms are fully wired — they
- *    build a wa.me link exactly like the original.
+ *  - Razorpay / GPay / jsPDF still need payment integrations, so those
+ *    controls remain placeholders. Orders and inquiries persist to
+ *    Firebase before their WhatsApp confirmation links are opened.
  *  - The AI chat widget sends canned responses instead of calling an
  *    LLM API (there's nowhere to safely put a key in front-end code).
  *    Wire `sendMessage` up to your own backend to make it real.
@@ -71,10 +70,13 @@ export default function App() {
   const [chatInput, setChatInput] = useState("");
 
   const [adminOpen, setAdminOpen] = useState(false);
-  const [adminUnlocked, setAdminUnlocked] = useState(false);
+  const [adminUser, setAdminUser] = useState(null);
+  const [adminEmail, setAdminEmail] = useState("");
   const [adminPw, setAdminPw] = useState("");
   const [adminError, setAdminError] = useState(false);
+  const [adminMessage, setAdminMessage] = useState("");
   const [orders, setOrders] = useState([]);
+  const [inquiries, setInquiries] = useState([]);
 
   const fileInputRef = useRef(null);
 
@@ -82,6 +84,32 @@ export default function App() {
     const t = setTimeout(() => setSplashHidden(true), 5000);
     return () => clearTimeout(t);
   }, []);
+
+  useEffect(() => onAuthStateChanged(auth, async (user) => {
+    if (!user) {
+      setAdminUser(null);
+      return;
+    }
+    const token = await user.getIdTokenResult();
+    if (token.claims.admin === true) setAdminUser(user);
+    else {
+      await signOut(auth);
+      setAdminUser(null);
+    }
+  }), []);
+
+  useEffect(() => {
+    if (!adminUser) {
+      setOrders([]);
+      setInquiries([]);
+      return undefined;
+    }
+
+    return subscribeToAdminData((type, data) => {
+      if (type === "orders") setOrders(data);
+      else setInquiries(data);
+    }, (error) => setAdminMessage(error.message));
+  }, [adminUser]);
 
   useEffect(() => {
     const revealItems = document.querySelectorAll(".as-section, .as-hero");
@@ -175,9 +203,14 @@ export default function App() {
     return encodeURIComponent(`Hi Amman Studios! I'd like to order:\n\n${lines.join("\n")}`);
   }
 
-  function checkoutViaWhatsapp() {
+  async function checkoutViaWhatsapp() {
     if (cart.length === 0) return;
-    setOrders((prev) => [{ items: cart, total: cartTotal, method: "WhatsApp", ts: Date.now() }, ...prev]);
+    try {
+      await saveOrder({ items: cart, total: cartTotal, method: "WhatsApp" });
+    } catch (error) {
+      alert(`We couldn't save your order just now. Please try again. (${error.message})`);
+      return;
+    }
     window.open(`https://wa.me/${WHATSAPP_NUMBER}?text=${buildCartWaMessage()}`, "_blank");
   }
 
@@ -198,7 +231,24 @@ export default function App() {
     setPhotos((prev) => prev.filter((_, i) => i !== idx));
   }
 
-  function confirmUploadOrder() {
+  async function confirmUploadOrder() {
+    if (!upForm.name.trim() || !upForm.phone.trim() || !upForm.product) {
+      alert("Please enter your name, phone number, and select a product.");
+      return;
+    }
+    try {
+      await saveOrder({
+        customer: { name: upForm.name.trim(), phone: upForm.phone.trim() },
+        items: [{ name: upForm.product, qty: 1 }],
+        total: 0,
+        method: "Photo order via WhatsApp",
+        occasion: upForm.occasion,
+        notes: upForm.notes,
+      }, photos.map(({ file }) => file));
+    } catch (error) {
+      alert(`We couldn't save your order and photos. Please try again. (${error.message})`);
+      return;
+    }
     const lines = [
       `Order details:`,
       `Name: ${upForm.name || "-"}`,
@@ -219,7 +269,17 @@ export default function App() {
     setUpForm({ name: "", phone: "", product: "", occasion: "", notes: "" });
   }
 
-  function submitContactForm() {
+  async function submitContactForm() {
+    if (!cfForm.name.trim() || !cfForm.phone.trim()) {
+      alert("Please enter your name and phone number.");
+      return;
+    }
+    try {
+      await saveInquiry({ ...cfForm, name: cfForm.name.trim(), phone: cfForm.phone.trim() });
+    } catch (error) {
+      alert(`We couldn't save your enquiry. Please try again. (${error.message})`);
+      return;
+    }
     const lines = [
       `Custom order enquiry from the website:`,
       `Name: ${cfForm.name || "-"}`,
@@ -230,12 +290,22 @@ export default function App() {
     window.open(`https://wa.me/${WHATSAPP_NUMBER}?text=${encodeURIComponent(lines.join("\n"))}`, "_blank");
   }
 
-  function checkAdminPassword() {
-    if (adminPw === "1234") {
-      setAdminUnlocked(true);
+  async function checkAdminPassword() {
+    try {
+      const credential = await signInWithEmailAndPassword(auth, adminEmail, adminPw);
+      const token = await credential.user.getIdTokenResult();
+      if (token.claims.admin !== true) {
+        await signOut(auth);
+        setAdminMessage("This account is not authorized for admin access.");
+        setAdminError(true);
+        return;
+      }
       setAdminError(false);
-    } else {
+      setAdminMessage("");
+      setAdminPw("");
+    } catch {
       setAdminError(true);
+      setAdminMessage("Sign-in failed. Check your Firebase admin email and password.");
     }
   }
 
@@ -346,13 +416,25 @@ export default function App() {
       <AdminPanel
         open={adminOpen}
         onClose={() => setAdminOpen(false)}
-        unlocked={adminUnlocked}
+        unlocked={Boolean(adminUser)}
+        email={adminEmail}
+        onEmailChange={setAdminEmail}
         password={adminPw}
         onPasswordChange={setAdminPw}
         onCheckPassword={checkAdminPassword}
         error={adminError}
+        message={adminMessage}
+        inquiries={inquiries}
         orders={orders}
-        onClearOrders={() => setOrders([])}
+        onClearOrders={async () => {
+          try {
+            await clearAdminData();
+            setAdminMessage("");
+          } catch (error) {
+            setAdminMessage(`Could not clear saved data: ${error.message}`);
+          }
+        }}
+        onSignOut={() => signOut(auth)}
       />
     </div>
   );
